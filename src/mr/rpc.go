@@ -21,3 +21,21 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type GetTaskArgs struct {}
+
+type GetTaskReply struct {
+	TaskID int
+	TaskType TaskType
+	Filename string
+	NReduce int
+	NMap int
+	Generation int
+}
+
+type ReportTaskReply struct {}
+
+type ReportTaskArgs struct {
+	TaskID int
+	TaskType TaskType
+	Generation int
+}
