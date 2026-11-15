@@ -470,6 +470,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 && rf.snapshotIndex > 0 {
+		rf.commitIndex = max(rf.commitIndex, rf.snapshotIndex)
+
+ 		msg := raftapi.ApplyMsg{
+			SnapshotValid: true,
+			Snapshot: snapshot,
+			SnapshotIndex: rf.snapshotIndex,
+			SnapshotTerm: rf.snapshotTerm,
+		}
+		rf.pendingSnapshot = &msg
+	}
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.applier()
@@ -929,10 +942,10 @@ func (rf *Raft) applier() {
 			continue
 		}
 
+		if rf.lastApplied < rf.snapshotIndex {
+			rf.lastApplied = rf.snapshotIndex
+		}
 		if rf.lastApplied < rf.commitIndex {
-			if rf.lastApplied < rf.snapshotIndex {
-				rf.lastApplied = rf.snapshotIndex
-			}
 			rf.lastApplied++
 			index := rf.lastApplied
 			sliceIndex := index - rf.snapshotIndex

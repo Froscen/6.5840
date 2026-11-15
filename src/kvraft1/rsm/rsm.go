@@ -2,21 +2,34 @@ package rsm
 
 import (
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me  int
+	Id  int64
+	Req any
 }
 
+type result struct {
+	Err   rpc.Err
+	Reply any
+}
+
+type pendingRequest struct {
+	Op   Op
+	Ch   chan result
+	Term int
+}
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +51,8 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	nextID  int64
+	request map[int]pendingRequest
 }
 
 // servers[] contains the ports of the set of
@@ -61,17 +76,21 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		request:      make(map[int]pendingRequest),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+
+	go rsm.reader()
+	go rsm.ticker()
+
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -83,5 +102,130 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	rsm.mu.Lock()
+
+	rsm.nextID++
+	op := Op{
+		Me:  rsm.me,
+		Id:  rsm.nextID,
+		Req: req,
+	}
+
+	index, term, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+
+	ch := make(chan result, 1)
+	rsm.request[index] = pendingRequest{
+		Op:   op,
+		Ch:   ch,
+		Term: term,
+	}
+	rsm.mu.Unlock()
+
+	res := <-ch
+
+	return res.Err, res.Reply // i'm dead, try another server.
+}
+
+func (rsm *RSM) reader() {
+	for {
+		msg, ok := <-rsm.applyCh
+		if !ok {
+			rsm.mu.Lock()
+
+			requests := make(map[int]pendingRequest)
+			for index, request := range rsm.request {
+				requests[index] = request
+			}
+			rsm.request = make(map[int]pendingRequest)
+			rsm.mu.Unlock()
+
+			for _, request := range requests {
+				request.Ch <- result{
+					Err: rpc.ErrWrongLeader,
+				}
+			}
+			return
+		}
+
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			reply := rsm.sm.DoOp(op.Req)
+
+			rsm.mu.Lock()
+			request, ok := rsm.request[msg.CommandIndex]
+			if ok {
+				delete(rsm.request, msg.CommandIndex)
+			}
+			rsm.mu.Unlock()
+
+			if ok {
+				if request.Op.Me == op.Me && request.Op.Id == op.Id {
+					request.Ch <- result{
+						Err:   rpc.OK,
+						Reply: reply,
+					}
+				} else {
+					request.Ch <- result{
+						Err: rpc.ErrWrongLeader,
+					}
+				}
+			}
+
+			rsm.Snapshot(msg.CommandIndex)
+		}
+		if msg.SnapshotValid {
+			rsm.sm.Restore(msg.Snapshot)
+
+			rsm.mu.Lock()
+			requests := make(map[int]pendingRequest)
+			for index, request := range rsm.request {
+				if index <= msg.SnapshotIndex {
+					requests[index] = request
+					delete(rsm.request, index)
+				}
+			}
+			rsm.mu.Unlock()
+
+			for _, request := range requests {
+				request.Ch <- result{
+					Err: rpc.ErrWrongLeader,
+				}
+			}
+		}
+	}
+}
+
+func (rsm *RSM) Snapshot(index int) {
+	if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > rsm.maxraftstate {
+		snapshot := rsm.sm.Snapshot()
+		rsm.rf.Snapshot(index, snapshot)
+	}
+}
+
+func (rsm *RSM) ticker() {
+	for {
+		currentTerm, isLeader := rsm.rf.GetState()
+		requests := make(map[int]pendingRequest)
+
+		rsm.mu.Lock()
+		for index, request := range rsm.request {
+			if request.Term < currentTerm || !isLeader {
+				requests[index] = request
+				delete(rsm.request, index)
+			}
+		}
+		rsm.mu.Unlock()
+
+		for _, request := range requests {
+			request.Ch <- result{
+				Err: rpc.ErrWrongLeader,
+			}
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }
