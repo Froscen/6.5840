@@ -14,6 +14,7 @@ type FreezeShardReply struct {
 	State []byte
 	Num   shardcfg.Tnum
 	Err   rpc.Err
+	Moved bool
 }
 
 type InstallShardArgs struct {
@@ -33,4 +34,13 @@ type DeleteShardArgs struct {
 
 type DeleteShardReply struct {
 	Err rpc.Err
+}
+
+type ConfigArgs struct {
+	Config shardcfg.ShardConfig
+}
+
+type ConfigReply struct {
+	Err rpc.Err
+	CurrentNum shardcfg.Tnum
 }
